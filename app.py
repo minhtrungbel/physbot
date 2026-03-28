@@ -295,4 +295,4 @@ if __name__ == "__main__":
                 console.print("[red]Khong nghe thay gi. Kiem tra lai mic.")
                 
     except KeyboardInterrupt:
-        console.print("\n[red]Thoat...")
+        console.print("\n[red]Thoat...") 
