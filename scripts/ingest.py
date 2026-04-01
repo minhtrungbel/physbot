@@ -1,206 +1,139 @@
 # scripts/ingest.py
-"""
-Đọc tất cả file PDF trong thư mục temp_pdfs/
-Trích xuất text, cắt chunks, lưu vào ChromaDB
-"""
-
 import os
-import sys
-import re
+import glob
 from pathlib import Path
-
-# Thêm đường dẫn gốc để import backend
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import chromadb
-from chromadb.utils import embedding_functions
-from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import PyPDF2
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
+from dotenv import load_dotenv
+load_dotenv()
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+POPPLER_PATH = r"C:\poppler-25.12.0\Library\bin"  # sửa lại
+# ── CẤU HÌNH ─────────────────────────────────────────────────────
+PDF_DIR   = "data/raw"          # để PDF SGK vào đây
+DB_DIR    = "data/chroma_db"    # ChromaDB sẽ lưu ở đây
+CHUNK_SIZE = 500                # ký tự mỗi chunk
+OVERLAP    = 50                 # overlap giữa các chunk
 
-# ========== CẤU HÌNH ==========
-PDF_FOLDER = "temp_pdfs"           # Thư mục chứa PDF đã sync từ MEGA
-CHROMA_PATH = "chroma_db"          # Thư mục lưu ChromaDB
-CHUNK_SIZE = 800                    # Kích thước mỗi chunk (ký tự)
+# ── MODEL EMBEDDING ───────────────────────────────────────────────
+# MiniLM nhẹ, chạy được trên PC không cần GPU
+model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
-# ========== KHỞI TẠO CHROMA DB ==========
-print("🔧 Đang khởi tạo ChromaDB...")
-
-# Tạo client persistent
-client = chromadb.PersistentClient(path=CHROMA_PATH)
-
-# Dùng DefaultEmbeddingFunction (chạy ONNX, không cần PyTorch)
-from chromadb.utils import embedding_functions
-embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="paraphrase-MiniLM-L3-v2"
-)
-# Thêm dòng này để tránh lỗi SSL trên Colab
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# Tạo collection (nếu chưa có)
-collection = client.get_or_create_collection(
-    name="sgk_vatly",
-    embedding_function=embedding_fn
-)
-
-print(f"✅ ChromaDB sẵn sàng. Collection hiện có: {collection.count()} chunks\n")
-
-
-# ========== HÀM XỬ LÝ PDF ==========
-def extract_text_from_pdf(pdf_path):
-    """Đọc text từ file PDF"""
-    text = ""
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Thử PyPDF2 trước, nếu không có text thì dùng OCR."""
+    # Thử text-based trước
     try:
-        reader = PdfReader(pdf_path)
-        num_pages = len(reader.pages)
-        print(f"   📄 Số trang: {num_pages}")
-        
-        for page_num, page in enumerate(reader.pages, 1):
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-            else:
-                print(f"   ⚠️ Trang {page_num} không có text (có thể là hình ảnh)")
-        
-        return text
-    except Exception as e:
-        print(f"   ❌ Lỗi đọc PDF: {e}")
-        return None
+        import PyPDF2
+        text = ""
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+        if len(text.strip()) > 100:  # có text thật
+            return text
+    except:
+        pass
 
+    # Fallback: OCR từng trang
+    print(f"  → Dùng OCR (chậm hơn ~30s/trang)...")
+    text = ""
+    images = convert_from_path(pdf_path, dpi=200, poppler_path=POPPLER_PATH)
+    for i, img in enumerate(images):
+        page_text = pytesseract.image_to_string(img, lang="vie")
+        text += page_text + "\n"
+        if (i + 1) % 10 == 0:
+            print(f"    OCR xong trang {i+1}/{len(images)}")
+    return text
 
-def clean_text(text):
-    """Làm sạch text: loại bỏ ký tự thừa"""
-    # Loại bỏ khoảng trắng thừa
-    text = re.sub(r'\s+', ' ', text)
-    # Loại bỏ các dòng chỉ toàn số trang
-    text = re.sub(r'\b\d+\b\s*', '', text)
-    return text.strip()
-
-
-def split_text(text, chunk_size=CHUNK_SIZE):
-    """Cắt text thành các chunks theo câu"""
-    # Tách thành các câu
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) -> list[str]:
+    """Cắt text thành chunks có overlap."""
     chunks = []
-    current_chunk = ""
-    
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= chunk_size:
-            current_chunk += sentence + " "
-        else:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
-    
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    
-    # Nếu không cắt được thành câu, cắt theo độ dài
-    if not chunks and len(text) > chunk_size:
-        for i in range(0, len(text), chunk_size - 100):
-            chunks.append(text[i:i + chunk_size])
-    
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
     return chunks
 
-
-def is_useful_content(text):
-    """Kiểm tra xem chunk có phải nội dung học tập không"""
-    keywords = [
-        'dao động', 'điều hòa', 'biên độ', 'tần số', 'chu kỳ',
-        'lực', 'khối lượng', 'gia tốc', 'vận tốc', 'quãng đường',
-        'điện tích', 'điện trở', 'công suất', 'năng lượng',
-        'phương pháp giải', 'lời giải chi tiết', 'đáp án',
-        'công thức', 'định luật', 'bài tập'
-    ]
+def ingest():
+    # Tạo thư mục nếu chưa có
+    os.makedirs(DB_DIR, exist_ok=True)
     
-    text_lower = text.lower()
-    count = sum(1 for kw in keywords if kw in text_lower)
+    # Khởi tạo ChromaDB
+    client = chromadb.PersistentClient(path=DB_DIR)
     
-    # Chunks có ít nhất 2 từ khóa và dài hơn 50 ký tự
-    return count >= 2 and len(text) > 50
-
-
-# ========== HÀM INGEST CHÍNH ==========
-def ingest_all_pdfs():
-    """Đọc tất cả PDF trong folder và ingest vào ChromaDB"""
+    # Xóa collection cũ nếu có (để chạy lại sạch)
+    try:
+        client.delete_collection("physbot_sgk")
+    except:
+        pass
     
-    # Kiểm tra thư mục PDF
-    pdf_folder = Path(PDF_FOLDER)
-    if not pdf_folder.exists():
-        print(f"❌ Thư mục {PDF_FOLDER} không tồn tại!")
-        print("   Hãy tạo thư mục và đặt file PDF vào đó.")
-        return
+    collection = client.create_collection(
+        name="physbot_sgk",
+        metadata={"description": "SGK Vật lý 10-11-12"}
+    )
     
-    # Lấy tất cả file PDF
-    pdf_files = list(pdf_folder.rglob("*.pdf")) + list(pdf_folder.rglob("*.PDF"))
-
-    pdf_files = list(set(pdf_files))
+    # Tìm tất cả PDF trong data/raw/
+    pdf_files = glob.glob(f"{PDF_DIR}/**/*.pdf", recursive=True) + \
+                glob.glob(f"{PDF_DIR}/*.pdf")
     
     if not pdf_files:
-        print(f"📂 Thư mục {PDF_FOLDER} không có file PDF nào!")
-        print("   Hãy upload PDF lên MEGA để tự động sync vào thư mục này.")
+        print(f"Không tìm thấy PDF trong {PDF_DIR}/")
+        print("Tải SGK từ sach.giaoducvietnam.vn rồi để vào data/raw/")
         return
     
-    print(f"📚 Tìm thấy {len(pdf_files)} file PDF:")
-    for f in pdf_files:
-        print(f"   - {f.name}")
+    print(f"Tìm thấy {len(pdf_files)} file PDF")
     
-    print("\n" + "="*60)
-    print("🚀 BẮT ĐẦU INGEST")
-    print("="*60)
-    
-    total_chunks = 0
+    all_chunks = []
+    all_ids = []
+    all_metadata = []
     
     for pdf_path in pdf_files:
-        print(f"\n📄 Đang xử lý: {pdf_path.name}")
+        print(f"Đang xử lý: {pdf_path}")
         
-        # Đọc text
         text = extract_text_from_pdf(pdf_path)
-        if not text:
-            print(f"   ⚠️ Bỏ qua: không đọc được text")
+        if not text.strip():
+            print(f"  → Không đọc được text (PDF scan?), bỏ qua")
             continue
-        
-        # Làm sạch text
-        text = clean_text(text)
-        
-        # Cắt chunks
-        chunks = split_text(text)
-        print(f"   ✂️ Cắt thành {len(chunks)} chunks")
-        
-        # Lọc chunks có nội dung hữu ích
-        useful_chunks = [c for c in chunks if is_useful_content(c)]
-        print(f"   📌 Giữ lại {len(useful_chunks)} chunks có nội dung học tập")
-        
-        # Thêm vào ChromaDB
-        if useful_chunks:
-            for i, chunk in enumerate(useful_chunks):
-                try:
-                    collection.add(
-                        documents=[chunk],
-                        metadatas=[{
-                            "source": pdf_path.name,
-                            "chunk_index": i
-                        }],
-                        ids=[f"{pdf_path.stem}_{i}"]
-                    )
-                except Exception as e:
-                    print(f"   ❌ Lỗi khi thêm chunk {i}: {e}")
             
-            total_chunks += len(useful_chunks)
-            print(f"   ✅ Đã thêm {len(useful_chunks)} chunks vào ChromaDB")
-        else:
-            print(f"   ⚠️ Không có chunk hữu ích nào, bỏ qua")
+        chunks = chunk_text(text)
+        filename = Path(pdf_path).stem
+        
+        for i, chunk in enumerate(chunks):
+            if len(chunk.strip()) < 50:  # bỏ chunk quá ngắn
+                continue
+            chunk_id = f"{filename}_chunk_{i}"
+            all_chunks.append(chunk)
+            all_ids.append(chunk_id)
+            all_metadata.append({"source": filename, "chunk_index": i})
     
-    # Kết quả
-    print("\n" + "="*60)
-    print("✅ INGEST HOÀN TẤT!")
-    print(f"   📊 Tổng số file: {len(pdf_files)}")
-    print(f"   📦 Tổng số chunks: {total_chunks}")
-    print(f"   💾 ChromaDB lưu tại: {os.path.abspath(CHROMA_PATH)}")
-    print(f"   📚 Collection hiện có: {collection.count()} chunks")
-    print("="*60)
+    if not all_chunks:
+        print("Không có chunk nào để nhúng!")
+        return
+    
+    print(f"\nĐang nhúng {len(all_chunks)} chunks vào ChromaDB...")
+    print("(Lần đầu có thể mất 5-15 phút tùy số lượng PDF)")
+    
+    # Nhúng theo batch 100 để không out of memory
+    BATCH = 100
+    for i in range(0, len(all_chunks), BATCH):
+        batch_chunks    = all_chunks[i:i+BATCH]
+        batch_ids       = all_ids[i:i+BATCH]
+        batch_meta      = all_metadata[i:i+BATCH]
+        batch_embeddings = model.encode(batch_chunks).tolist()
+        
+        collection.add(
+            documents=batch_chunks,
+            embeddings=batch_embeddings,
+            ids=batch_ids,
+            metadatas=batch_meta
+        )
+        print(f"  Xong {min(i+BATCH, len(all_chunks))}/{len(all_chunks)} chunks")
+    
+    print(f"\n✓ Xong! Đã nhúng {len(all_chunks)} chunks vào {DB_DIR}/")
 
-
-# ========== MAIN ==========
 if __name__ == "__main__":
-    ingest_all_pdfs()
+    ingest()
