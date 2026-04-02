@@ -1,139 +1,183 @@
-# scripts/ingest.py
 import os
 import glob
+import re
 from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 import PyPDF2
-import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image
 from dotenv import load_dotenv
+import pytesseract
+
 load_dotenv()
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-POPPLER_PATH = r"C:\poppler-25.12.0\Library\bin"  # sửa lại
-# ── CẤU HÌNH ─────────────────────────────────────────────────────
-PDF_DIR   = "data/raw"          # để PDF SGK vào đây
-DB_DIR    = "data/chroma_db"    # ChromaDB sẽ lưu ở đây
-CHUNK_SIZE = 500                # ký tự mỗi chunk
-OVERLAP    = 50                 # overlap giữa các chunk
 
-# ── MODEL EMBEDDING ───────────────────────────────────────────────
-# MiniLM nhẹ, chạy được trên PC không cần GPU
-model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+PDF_DIR = "data/raw"
+PROCESSED_DIR = "data/processed"
+DB_DIR = "data/chroma_db"
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Thử PyPDF2 trước, nếu không có text thì dùng OCR."""
-    # Thử text-based trước
+COLLECTION_NAME = "physbot_sgk"
+POPPLER_PATH = r"C:\poppler-25.12.0\Library\bin"
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+model = SentenceTransformer(
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
+
+
+def is_vietnamese_text(text: str) -> bool:
+    vietnamese_chars = set(
+        "àáâãèéêìíòóôõùúýăđơư"
+        "ạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ"
+        "ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯ"
+        "ẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ"
+    )
+    count = sum(1 for c in text if c in vietnamese_chars)
+    return count / max(len(text), 1) >= 0.01
+
+
+def semantic_chunk_text(text: str):
+    parts = re.split(r"(Bài\s+\d+|Câu\s+\d+)", text)
+    chunks = []
+    current = ""
+
+    for part in parts:
+        if re.match(r"(Bài\s+\d+|Câu\s+\d+)", part):
+            if current.strip():
+                chunks.append(current.strip())
+            current = part
+        else:
+            current += "\n" + part
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def ocr_with_tesseract(image) -> str:
+    text = pytesseract.image_to_string(image, lang="vie")
+    return text
+
+
+def extract_text_from_pdf(pdf_path: str):
+    filename = Path(pdf_path).stem
+    cache_path = Path(PROCESSED_DIR) / f"{filename}.txt"
+
+    if cache_path.exists():
+        print(f"  [cache] Dung cache: {cache_path}", flush=True)
+        return cache_path.read_text(encoding="utf-8")
+
+    text = ""
+
+    # Buoc 1: Thu extract text bang PyPDF2
     try:
-        import PyPDF2
-        text = ""
         with open(pdf_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
-                text += page.extract_text() + "\n"
-        if len(text.strip()) > 100:  # có text thật
-            return text
-    except:
-        pass
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
 
-    # Fallback: OCR từng trang
-    print(f"  → Dùng OCR (chậm hơn ~30s/trang)...")
-    text = ""
-    images = convert_from_path(pdf_path, dpi=200, poppler_path=POPPLER_PATH)
+        if len(text.strip()) > 100 and is_vietnamese_text(text):
+            print("  [PyPDF2] Extract thanh cong, co dau tieng Viet.", flush=True)
+            cache_path.write_text(text, encoding="utf-8")
+            return text
+        else:
+            print("  [PyPDF2] Khong co dau hoac qua ngan -> chuyen sang OCR.", flush=True)
+            text = ""
+
+    except Exception as e:
+        print(f"  [PyPDF2] Loi: {e} -> chuyen sang OCR.", flush=True)
+
+    # Buoc 2: OCR bang Tesseract
+    print("  OCR bang Tesseract (tieng Viet)...", flush=True)
+
+    checkpoint_dir = Path(PROCESSED_DIR) / f"{filename}_pages"
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    print("  Dang convert PDF sang anh (co the mat vai phut)...", flush=True)
+    images = convert_from_path(
+        pdf_path,
+        dpi=200,
+        poppler_path=POPPLER_PATH
+    )
+
+    total = len(images)
+    print(f"  Convert xong! Tong so trang: {total}", flush=True)
+
     for i, img in enumerate(images):
-        page_text = pytesseract.image_to_string(img, lang="vie")
-        text += page_text + "\n"
-        if (i + 1) % 10 == 0:
-            print(f"    OCR xong trang {i+1}/{len(images)}")
+        page_cache = checkpoint_dir / f"page_{i:04d}.txt"
+
+        if page_cache.exists():
+            print(f"  Trang {i+1}/{total} [cache]", flush=True)
+            continue
+
+        print(f"  OCR trang {i+1}/{total}...", flush=True)
+        page_text = ocr_with_tesseract(img)
+        page_cache.write_text(page_text, encoding="utf-8")
+        print(f"  Trang {i+1}/{total} xong", flush=True)
+
+    # Ghep tat ca trang lai
+    all_pages = sorted(checkpoint_dir.glob("page_*.txt"))
+    text = "\n".join(p.read_text(encoding="utf-8") for p in all_pages)
+    cache_path.write_text(text, encoding="utf-8")
+
     return text
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) -> list[str]:
-    """Cắt text thành chunks có overlap."""
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
 
 def ingest():
-    # Tạo thư mục nếu chưa có
     os.makedirs(DB_DIR, exist_ok=True)
-    
-    # Khởi tạo ChromaDB
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+
     client = chromadb.PersistentClient(path=DB_DIR)
-    
-    # Xóa collection cũ nếu có (để chạy lại sạch)
+
     try:
-        client.delete_collection("physbot_sgk")
+        collection = client.get_collection(COLLECTION_NAME)
     except:
-        pass
-    
-    collection = client.create_collection(
-        name="physbot_sgk",
-        metadata={"description": "SGK Vật lý 10-11-12"}
-    )
-    
-    # Tìm tất cả PDF trong data/raw/
-    pdf_files = glob.glob(f"{PDF_DIR}/**/*.pdf", recursive=True) + \
-                glob.glob(f"{PDF_DIR}/*.pdf")
-    
-    if not pdf_files:
-        print(f"Không tìm thấy PDF trong {PDF_DIR}/")
-        print("Tải SGK từ sach.giaoducvietnam.vn rồi để vào data/raw/")
-        return
-    
-    print(f"Tìm thấy {len(pdf_files)} file PDF")
-    
+        collection = client.create_collection(COLLECTION_NAME)
+
+    pdf_files = glob.glob(f"{PDF_DIR}/**/*.pdf", recursive=True)
+
     all_chunks = []
     all_ids = []
-    all_metadata = []
-    
+    all_meta = []
+
     for pdf_path in pdf_files:
-        print(f"Đang xử lý: {pdf_path}")
-        
+        print(f"Dang xu ly: {pdf_path}", flush=True)
+
         text = extract_text_from_pdf(pdf_path)
-        if not text.strip():
-            print(f"  → Không đọc được text (PDF scan?), bỏ qua")
-            continue
-            
-        chunks = chunk_text(text)
+        chunks = semantic_chunk_text(text)
         filename = Path(pdf_path).stem
-        
+
         for i, chunk in enumerate(chunks):
-            if len(chunk.strip()) < 50:  # bỏ chunk quá ngắn
+            if len(chunk.strip()) < 50:
                 continue
-            chunk_id = f"{filename}_chunk_{i}"
+
             all_chunks.append(chunk)
-            all_ids.append(chunk_id)
-            all_metadata.append({"source": filename, "chunk_index": i})
-    
+            all_ids.append(f"{filename}_{i}")
+            all_meta.append({
+                "source": filename,
+                "chunk_index": i
+            })
+
     if not all_chunks:
-        print("Không có chunk nào để nhúng!")
+        print("Khong co chunk nao de ingest!")
         return
-    
-    print(f"\nĐang nhúng {len(all_chunks)} chunks vào ChromaDB...")
-    print("(Lần đầu có thể mất 5-15 phút tùy số lượng PDF)")
-    
-    # Nhúng theo batch 100 để không out of memory
-    BATCH = 100
-    for i in range(0, len(all_chunks), BATCH):
-        batch_chunks    = all_chunks[i:i+BATCH]
-        batch_ids       = all_ids[i:i+BATCH]
-        batch_meta      = all_metadata[i:i+BATCH]
-        batch_embeddings = model.encode(batch_chunks).tolist()
-        
-        collection.add(
-            documents=batch_chunks,
-            embeddings=batch_embeddings,
-            ids=batch_ids,
-            metadatas=batch_meta
-        )
-        print(f"  Xong {min(i+BATCH, len(all_chunks))}/{len(all_chunks)} chunks")
-    
-    print(f"\n✓ Xong! Đã nhúng {len(all_chunks)} chunks vào {DB_DIR}/")
+
+    print(f"\nDang tao embeddings cho {len(all_chunks)} chunks...", flush=True)
+    embeddings = model.encode(all_chunks, show_progress_bar=True).tolist()
+
+    collection.add(
+        documents=all_chunks,
+        embeddings=embeddings,
+        ids=all_ids,
+        metadatas=all_meta
+    )
+
+    print("Ingest hoan tat!")
+
 
 if __name__ == "__main__":
     ingest()
