@@ -20,3 +20,4 @@ repos:
    rev: v8.17.0
    hooks:
    - id: gitleaks
+   buildCommand: pip install --no-cache-dir -r requirements.txt
